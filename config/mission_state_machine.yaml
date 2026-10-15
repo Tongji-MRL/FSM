@@ -1,0 +1,21 @@
+mission_planner:
+  ros__parameters:
+    run_start_topic: /tongji_mrl/mission/run_start
+    task4_command_topic: /tongji_mrl/mission/task4_cmd
+
+    uav_map_topic: /tongji_mrl/tsky/map
+    uav_task_command_topic: /tongji_mrl/tsky/task_cmd
+    usv_task_command_topic: /tongji_mrl/twave/task_cmd
+
+    uav_progress_topic: /tongji_mrl/tsky/progress
+    usv_progress_topic: /tongji_mrl/twave/progress
+
+    usv_task1_result_topic: /tongji_mrl/twave/task1_result
+    uav_task3_result_topic: /tongji_mrl/tsky/task3_result
+    usv_task3_result_topic: /tongji_mrl/twave/task3_result
+
+    mission_task_report_topic: /tongji_mrl/mission/task_report
+    mission_status_topic: /tongji_mrl/mission/status
+    mission_fault_topic: /tongji_mrl/mission/fault
+
+    status_publish_period_sec: 1.0
