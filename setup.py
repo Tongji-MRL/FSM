@@ -11,6 +11,8 @@ setup(
     version="0.1.0",
     py_modules=[
         "mission_planner_node",
+        "mission_contract",
+        "task4_guard",
     ],
     package_dir={
         "": "src",

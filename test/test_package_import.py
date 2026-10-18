@@ -1,5 +1,9 @@
-from robotx_mission_state_machine.state_machine import MainState
+import unittest
+
+from mission_contract import COURSE_SCHEMA, STATUS_SCHEMA
 
 
-def test_all_eight_main_states_are_defined():
-    assert {int(state) for state in MainState} == set(range(8))
+class PackageImportTests(unittest.TestCase):
+    def test_contract_modules_are_importable(self):
+        self.assertEqual(COURSE_SCHEMA, "twave-course-config-v1")
+        self.assertEqual(STATUS_SCHEMA, "twave-mission-status-v2")

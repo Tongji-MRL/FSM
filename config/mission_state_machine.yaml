@@ -1,6 +1,7 @@
 mission_planner:
   ros__parameters:
     run_start_topic: /tongji_mrl/mission/run_start
+    course_config_topic: /tongji_mrl/mission/course_config
     task4_command_topic: /tongji_mrl/mission/task4_cmd
 
     uav_map_topic: /tongji_mrl/tsky/map
@@ -19,3 +20,8 @@ mission_planner:
     mission_fault_topic: /tongji_mrl/mission/fault
 
     status_publish_period_sec: 1.0
+    progress_file: "~/.local/state/robotx/mission_planner/progress.jsonl"
+    # No AUTO/GPS/safety-health source is connected yet.  Do not claim it is
+    # ready in production; test launch may explicitly set this true.
+    local_safety_ready: false
+    task4_state_file: "~/.local/state/robotx/mission_planner/task4_state.json"

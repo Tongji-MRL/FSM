@@ -5,8 +5,14 @@ from rclpy.node import Node
 
 import json
 from std_msgs.msg import String
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 
 from pathlib import Path
+from datetime import datetime, timezone
+
+from mission_contract import (STATUS_SCHEMA, classify_error, course_status,
+                              mission_start_permitted, parse_course, parse_run_start)
+from task4_guard import Task4Guard
 
 class MissionPlannerNode(Node):
 
@@ -20,11 +26,22 @@ class MissionPlannerNode(Node):
             "Mission planner node started"
         )
 
+        self.declare_parameter("progress_file", "~/.local/state/robotx/mission_planner/progress.jsonl")
+        self.declare_parameter("run_start_topic", "/tongji_mrl/mission/run_start")
+        self.declare_parameter("course_config_topic", "/tongji_mrl/mission/course_config")
+        self.declare_parameter("task4_command_topic", "/tongji_mrl/mission/task4_cmd")
+        self.declare_parameter("mission_status_topic", "/tongji_mrl/mission/status")
+        self.declare_parameter("mission_fault_topic", "/tongji_mrl/mission/fault")
+        self.declare_parameter("mission_task_report_topic", "/tongji_mrl/mission/task_report")
+        self.declare_parameter("local_safety_ready", False)
+        self.declare_parameter("task4_state_file", "~/.local/state/robotx/mission_planner/task4_state.json")
+
         # ——————————————————————————————————————————————————————初始化一些变量
         # 保存progress的地址初始化
         self.progress_file = Path(
             r"D:\a_autowork\TJROBOTX\Final\主状态机\log\progress.jsonl"
         )
+        self.progress_file = Path(str(self.get_parameter("progress_file").value)).expanduser()
 
         # 创建log文件夹
         self.progress_file.parent.mkdir(
@@ -46,6 +63,20 @@ class MissionPlannerNode(Node):
 
         # 记录是否已经收到run_start
         self.run_start_received = False
+        self.run_id = None
+        self.run_command_id = None
+        self.course = None
+        self.course_loaded = False
+        # ``course_applied`` means applied by this FSM, never an inferred UAV ACK.
+        self.course_applied = False
+        self.course_fsm_accepted = False
+        self.uav_course_applied = False
+        self._forwarded_course_fingerprint = None
+        self.local_safety_ready = bool(self.get_parameter("local_safety_ready").value)
+        self.safety_state = "READY" if self.local_safety_ready else "WAITING_FOR_LOCAL_SAFETY"
+        self.recovery_conditions = [] if self.local_safety_ready else ["local_safety_ready"]
+        self.task4_guard = Task4Guard(str(self.get_parameter("task4_state_file").value))
+        self.task4_readiness_report_seq = None
 
         # 记录Task1开始命令是否已经发送
         self.task1_start_sent = False
@@ -87,7 +118,7 @@ class MissionPlannerNode(Node):
         # 订阅比赛开始的信息
         self.run_start_sub = self.create_subscription(
             String,
-            "/tongji_mrl/mission/run_start",
+            str(self.get_parameter("run_start_topic").value),
             self._on_run_start,
             10,
         )
@@ -95,9 +126,10 @@ class MissionPlannerNode(Node):
         # 接收OCS发送的赛场配置信息
         self.course_config_sub = self.create_subscription(
             String,
-            "/tongji_mrl/mission/course_config",
+            str(self.get_parameter("course_config_topic").value),
             self._on_course_config,
-            10,
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.TRANSIENT_LOCAL),
         )
 
         # 订阅USV任务结果
@@ -111,7 +143,7 @@ class MissionPlannerNode(Node):
         # 接收OCS发送的Task4命令
         self.task4_cmd_sub = self.create_subscription(
             String,
-            "/tongji_mrl/mission/task4_cmd",
+            str(self.get_parameter("task4_command_topic").value),
             self._on_task4_command,
             10,
         )
@@ -131,13 +163,19 @@ class MissionPlannerNode(Node):
             self._on_usv_checkpoint,
             10,
         )
+        self.task4_pause_ack_sub = self.create_subscription(
+            String, "/tongji_mrl/mission/task4_pause_ack", self._on_task4_pause_ack, 10,
+        )
 
         # ——————————————————————————————————————————————————————创建消息的publisher
         # 创建给ocs发布progress消息的publisher
         self.mission_status_pub = self.create_publisher(
             String,
-            "/tongji_mrl/mission/status",
+            str(self.get_parameter("mission_status_topic").value),
             10,
+        )
+        self.mission_fault_pub = self.create_publisher(
+            String, str(self.get_parameter("mission_fault_topic").value), 10,
         )
 
         # 给UAV发布任务命令
@@ -164,7 +202,7 @@ class MissionPlannerNode(Node):
         # 向OCS发布任务报告
         self.mission_task_report_pub = self.create_publisher(
             String,
-            "/tongji_mrl/mission/task_report",
+            str(self.get_parameter("mission_task_report_topic").value),
             10,
         )
 
@@ -208,7 +246,7 @@ class MissionPlannerNode(Node):
             )
 
     # 回调函数：一接收到"/tongji_mrl/mission/run_start"的比赛开始的信息，就且换状态为MAP_EXECUTE；且会调用函数，向uav和usv发布开始map任务的信息
-    def _on_run_start(self, msg: String) -> None:
+    def _legacy_on_run_start_pre_v2(self, msg: String) -> None:
         try:
             payload = json.loads(msg.data)
         except json.JSONDecodeError:
@@ -240,7 +278,7 @@ class MissionPlannerNode(Node):
         )
 
     # 收到OCS赛场配置后，原样转发给UAV
-    def _on_course_config(self, msg: String) -> None:
+    def _legacy_on_course_config_pre_v2(self, msg: String) -> None:
         # 把赛场配置信息转发给UAV
         forwarded_msg = String()
         forwarded_msg.data = msg.data
@@ -279,7 +317,7 @@ class MissionPlannerNode(Node):
         )
 
     # 接收OCS发送的Task4命令
-    def _on_task4_command(self, msg: String) -> None:
+    def _legacy_on_task4_command_pre_guard(self, msg: String) -> None:
         try:
             payload = json.loads(msg.data)
         except json.JSONDecodeError:
@@ -302,7 +340,7 @@ class MissionPlannerNode(Node):
         command_type = command.get("type")
 
         if command_type == "ASSISTANCE_REQUEST":
-            self.handle_assistance_request(
+            self._legacy_handle_assistance_request_pre_guard(
                 payload,
                 command,
             )
@@ -314,7 +352,7 @@ class MissionPlannerNode(Node):
             )
 
     # 接收UAV在进入Task4前保存的任务断点
-    def _on_uav_checkpoint(self, msg: String) -> None:
+    def _legacy_on_uav_checkpoint_pre_guard(self, msg: String) -> None:
         try:
             payload = json.loads(msg.data)
         except json.JSONDecodeError:
@@ -342,7 +380,7 @@ class MissionPlannerNode(Node):
 
 
     # 接收USV在进入Task4前保存的任务断点
-    def _on_usv_checkpoint(self, msg: String) -> None:
+    def _legacy_on_usv_checkpoint_pre_guard(self, msg: String) -> None:
         try:
             payload = json.loads(msg.data)
         except json.JSONDecodeError:
@@ -370,7 +408,7 @@ class MissionPlannerNode(Node):
 
     #————————————————————————————————————————————————————————————————————————————————————————————————定义其它的辅助函数
     # 整合uav和usv，以及本节点的状态，来发布的消息，进行写入本地的记录文件中，然后调用progress_publisher发布出去
-    def publish_combined_progress(self) -> None:
+    def _legacy_publish_combined_progress_pre_v2(self) -> None:
         payload = {
             "mission_planner": self.state,
             "uav": self.uav_progress,
@@ -730,7 +768,7 @@ class MissionPlannerNode(Node):
         )
 
     # AssistanceRequest处理函数
-    def handle_assistance_request(
+    def _legacy_handle_assistance_request_pre_guard(
         self,
         payload: dict,
         command: dict,
@@ -830,7 +868,7 @@ class MissionPlannerNode(Node):
         )
     
     # 检查task4的progress函数
-    def check_task4_progress(self) -> None:
+    def _legacy_check_task4_progress_pre_guard(self) -> None:
         if self.state != "TASK4_EXECUTE":
             return
 
@@ -1014,6 +1052,237 @@ class MissionPlannerNode(Node):
         self.get_logger().info(
             f"Previous mission resumed: {resume_state}"
         )
+
+    # --- Sole active OCS/FSM v2 callbacks and status publisher ---
+    def _on_run_start(self, msg: String) -> None:
+        try:
+            run_id, command_id = parse_run_start(json.loads(msg.data))
+        except (json.JSONDecodeError, ValueError) as exc:
+            self.get_logger().warning(f"Rejected RunStart: {exc}")
+            return
+        if self.state != "WAIT_FOR_BEGIN":
+            self.get_logger().warning("Rejected RunStart outside WAIT_FOR_BEGIN")
+            return
+        if self.run_id is not None and (run_id != self.run_id or command_id != self.run_command_id):
+            self.get_logger().warning("Rejected duplicate or cross-run RunStart")
+            return
+        self.run_start_received, self.run_id, self.run_command_id = True, run_id, command_id
+        self._try_start_mission()
+
+    def _on_course_config(self, msg: String) -> None:
+        try:
+            course = parse_course(json.loads(msg.data))
+        except (json.JSONDecodeError, ValueError) as exc:
+            self.get_logger().warning(f"Rejected Course configuration: {exc}")
+            return
+        if self.course is not None and self.course.fingerprint == course.fingerprint:
+            return
+        if self.state != "WAIT_FOR_BEGIN":
+            self.get_logger().warning("Rejected Course update after mission start")
+            return
+        self.course = course
+        self.course_loaded = True
+        self.course_fsm_accepted = True
+        self.course_applied = True
+        if self._forwarded_course_fingerprint != course.fingerprint:
+            forwarded = String(); forwarded.data = msg.data
+            self.uav_course_config_pub.publish(forwarded)
+            self._forwarded_course_fingerprint = course.fingerprint
+        self.get_logger().info(
+            f"Course accepted locally: course_id={course.course_id}; "
+            "UAV application confirmation pending"
+        )
+        # Make the successful local acceptance observable even before RunStart.
+        self.publish_combined_progress()
+        self._try_start_mission()
+
+    def _try_start_mission(self) -> None:
+        if self.state != "WAIT_FOR_BEGIN":
+            return
+        if not self.run_start_received or not self.course_fsm_accepted:
+            return
+        if not self.local_safety_ready:
+            self.safety_state = "WAITING_FOR_LOCAL_SAFETY"
+            self.recovery_conditions = ["local_safety_ready"]
+            self.publish_combined_progress()
+            return
+        if not mission_start_permitted(
+            run_start_received=self.run_start_received,
+            course_fsm_accepted=self.course_fsm_accepted,
+            local_safety_ready=self.local_safety_ready,
+        ):
+            return
+        self.safety_state, self.recovery_conditions = "READY", []
+        self.set_main_state("MAP_EXECUTE")
+        self.publish_map_start()
+
+    def _vehicle_status_v2(self, vehicle: str, progress: object) -> dict:
+        item = dict(progress) if isinstance(progress, dict) else {}
+        error = item.get("error")
+        severity, action = classify_error(error, task=item.get("task"), safety_state=self.safety_state)
+        return {
+            "vehicle": vehicle, "current_task": item.get("task"), "progress": item.get("progress"),
+            "ended": item.get("progress") in {"MAP_FINISH", "TASK1_FINISH", "TASK3_FINISH", "TASK4_READY"},
+            "error": error, "error_code": item.get("error_code", "UNKNOWN_ERROR" if error else "NONE"),
+            "error_severity": severity, "recommended_action": action,
+            "safety_state": item.get("safety_state", self.safety_state), "detail": item.get("detail", ""),
+        }
+
+    def publish_combined_progress(self) -> None:
+        legacy = {"mission_planner": self.state, "uav": self.uav_progress, "usv": self.usv_progress}
+        payload = {
+            **legacy, "schema_version": STATUS_SCHEMA, "run_id": self.run_id,
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "fsm_state": self.state,
+            "course": course_status(course=self.course,
+                                    fsm_accepted=self.course_fsm_accepted,
+                                    uav_applied=self.uav_course_applied),
+            "safety": {"state": self.safety_state, "recovery_conditions": self.recovery_conditions},
+            "vehicles": {"uav": self._vehicle_status_v2("uav", self.uav_progress),
+                         "usv": self._vehicle_status_v2("usv", self.usv_progress)},
+            "legacy": legacy,
+        }
+        with self.progress_file.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        msg = String(); msg.data = json.dumps(payload, ensure_ascii=False)
+        self.mission_status_pub.publish(msg)
+
+    def check_vehicle_error(self) -> bool:
+        if self.state in ("COMPLETE", "FAILED"):
+            return self.state == "FAILED"
+        for vehicle, progress in (("uav", self.uav_progress), ("usv", self.usv_progress)):
+            if not isinstance(progress, dict) or progress.get("error") in (None, "", "NONE"):
+                continue
+            severity, action = classify_error(progress.get("error"), task=progress.get("task"), safety_state=self.safety_state)
+            if severity == "STOP":
+                self.safety_state, self.recovery_conditions = "SAFE_STOP", ["explicit_safety_recovery_authorization"]
+                self.set_main_state("FAILED")
+                self.publish_task_end(failed_vehicle=vehicle, error_content=progress.get("error"))
+                self.mission_fault_pub.publish(String(data=json.dumps({"vehicle": vehicle, "error": progress.get("error"), "severity": severity})))
+                return True
+            if severity == "HOLD":
+                self.safety_state, self.recovery_conditions = "SAFE_HOLD", ["communications_restored", "operator_authorization"]
+                self.publish_combined_progress()
+                return True
+            self.publish_combined_progress()
+        return False
+
+    def _publish_task4_event(self, event_type: str, *, accepted: bool, detail: str = "") -> None:
+        record = self.task4_guard.record
+        payload = {
+            "run_id": self.run_id, "vehicle": record.get("vehicle"), "task": "TASK4",
+            "ack_scope": "fsm", "accepted": accepted, "detail": detail,
+            "command_id": record.get("command_id"),
+            "command": {"type": event_type, "command_seq": record.get("command_seq")},
+        }
+        if event_type == "INCIDENT_ACK":
+            payload["official_report"] = {"type": "incident_ack", "vehicle_id": record.get("vehicle"), "command_seq": record.get("command_seq")}
+        elif event_type == "READINESS_REPORT":
+            readiness_event_id = f"{record.get('command_id')}:readiness"
+            payload["readiness_event_id"] = readiness_event_id
+            payload["official_report"] = {"type": "readiness", "vehicle_id": record.get("vehicle"), "command_seq": record.get("command_seq"), "readiness_event_id": readiness_event_id, "dry_run": True}
+        message = String(); message.data = json.dumps(payload, ensure_ascii=False)
+        self.mission_task_report_pub.publish(message)
+
+    def _on_task4_command(self, msg: String) -> None:
+        try:
+            payload = json.loads(msg.data)
+            command = payload.get("command", {})
+            command_type = command.get("type")
+            if command_type == "READINESS_REPORT_PUBLISHED":
+                outcome = self.task4_guard.accept(payload, active_run_id=self.run_id, planner_state=self.state)
+                if outcome == "READINESS_REPORT_RECORDED":
+                    self.task4_readiness_report_seq = command["report_seq"]
+                    self.safety_state, self.recovery_conditions = "WAITING_READINESS_CONFIRM", ["valid_readiness_confirm"]
+                    self.publish_combined_progress()
+                return
+            if command_type == "READINESS_CONFIRM":
+                if self.task4_guard.confirm(payload, readiness_report_seq=self.task4_readiness_report_seq, safety_state=self.safety_state):
+                    # Confirmation only records a valid correlation.  No local
+                    # source has supplied recovery authorization/resume ACKs.
+                    self.safety_state = "WAITING_RECOVERY_AUTHORIZATION"
+                    self.recovery_conditions = ["explicit_recovery_authorization", "resume_ack_uav", "resume_ack_usv"]
+                    self.publish_combined_progress()
+                else:
+                    self._publish_task4_event("READINESS_CONFIRM_REJECTED", accepted=False, detail="correlation or safety gate failed")
+                return
+            outcome = self.task4_guard.accept(payload, active_run_id=self.run_id, planner_state=self.state)
+        except (json.JSONDecodeError, ValueError) as exc:
+            self.get_logger().warning(f"Rejected Task4 command: {exc}")
+            return
+        if outcome == "DUPLICATE":
+            return
+        if outcome == "POLICY_NOT_READY":
+            self._publish_task4_event("NOT_READY", accepted=False, detail="Task4 policy handler is not implemented")
+            return
+        self._publish_task4_event("INCIDENT_ACK", accepted=True, detail="accepted; waiting for safe pause and checkpoints")
+        for vehicle, publisher in (("uav", self.uav_task_cmd_pub), ("usv", self.usv_task_cmd_pub)):
+            request = {"vehicle": vehicle, "task": None, "progress": None, "error": None,
+                       "command": {"type": "SAFE_PAUSE_REQUEST", "command_id": self.task4_guard.record["command_id"], "run_id": self.run_id}}
+            outgoing = String(); outgoing.data = json.dumps(request); publisher.publish(outgoing)
+        self.safety_state, self.recovery_conditions = "WAITING_SAFE_PAUSE", ["pause_ack_uav", "pause_ack_usv", "checkpoint_uav", "checkpoint_usv"]
+        self.publish_combined_progress()
+
+    def _on_task4_pause_ack(self, msg: String) -> None:
+        try:
+            value = json.loads(msg.data)
+            accepted = self.task4_guard.pause_ack(
+                str(value.get("vehicle")), run_id=value.get("run_id"),
+                command_id=str(value.get("command_id")), accepted=value.get("accepted") is True,
+            )
+        except (json.JSONDecodeError, ValueError):
+            return
+        if accepted:
+            self._try_start_task4()
+
+    def _on_uav_checkpoint(self, msg: String) -> None:
+        self._on_task4_checkpoint("uav", msg)
+
+    def _on_usv_checkpoint(self, msg: String) -> None:
+        self._on_task4_checkpoint("usv", msg)
+
+    def _on_task4_checkpoint(self, vehicle: str, msg: String) -> None:
+        try:
+            accepted = self.task4_guard.checkpoint(vehicle, json.loads(msg.data))
+        except json.JSONDecodeError:
+            accepted = False
+        if accepted:
+            self._try_start_task4()
+
+    def _try_start_task4(self) -> None:
+        if not self.task4_guard.can_start() or self.safety_state in {"SAFE_HOLD", "SAFE_STOP"}:
+            return
+        self.task4_guard.mark_started()
+        self.task4_target_vehicle = self.task4_guard.record["vehicle"]
+        self.task4_command_seq = self.task4_guard.record["command_seq"]
+        self.task4_position = self.task4_guard.record["position"]
+        # The durable phase transition is complete.  Synchronize status before
+        # emitting any Task4 command so status-v2 cannot claim it is still
+        # waiting for conditions that Task4Guard has accepted.
+        self.safety_state, self.recovery_conditions = self.task4_guard.execution_safety_status()
+        self.set_main_state("TASK4_EXECUTE")
+        self.publish_combined_progress()
+        self.publish_task4_start()
+
+    def check_task4_progress(self) -> None:
+        if self.state != "TASK4_EXECUTE":
+            return
+        progress = self.uav_progress if self.task4_target_vehicle == "uav" else self.usv_progress
+        if not isinstance(progress, dict):
+            return
+        if progress.get("task") == "TASK4" and progress.get("progress") == "TASK4_ACK" and progress.get("command_id") == self.task4_guard.record.get("command_id") and not self.task4_ack_sent:
+            self.task4_ack_sent = True
+            # IncidentAck was already emitted for valid FSM acceptance; this
+            # is retained as a status-only executor acknowledgement.
+            self.publish_combined_progress()
+        if self.task4_guard.readiness(progress) and not self.task4_ready_sent:
+            self.task4_ready_sent = True
+            self._publish_task4_event("READINESS_REPORT", accepted=True, detail="dry-run on-station event")
+            # OCS assigns the official RxReport seq; it must be sent back in
+            # ReadinessConfirm.  Until then no recovery is possible.
+            self.safety_state, self.recovery_conditions = "WAITING_READINESS_REPORT_PUBLICATION", ["official_readiness_report_seq"]
+            self.publish_combined_progress()
+
 
 def main(args=None) -> None:
 
