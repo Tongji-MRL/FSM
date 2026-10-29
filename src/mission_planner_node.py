@@ -22,8 +22,11 @@ class MissionPlannerNode(Node):
 
         # ——————————————————————————————————————————————————————初始化一些变量
         # 保存progress的地址初始化
-        self.progress_file = Path(
-            r"D:\a_autowork\TJROBOTX\Final\主状态机\log\progress.jsonl"
+        self.progress_file = (
+            Path.home()
+            / ".ros"
+            / "robotx_mission_state_machine"
+            / "progress.jsonl"
         )
 
         # 创建log文件夹
@@ -46,6 +49,9 @@ class MissionPlannerNode(Node):
 
         # 记录是否已经收到run_start
         self.run_start_received = False
+
+        # 记录是否已经收到config
+        self.course_config_received = False
 
         # 记录Task1开始命令是否已经发送
         self.task1_start_sent = False
@@ -232,15 +238,20 @@ class MissionPlannerNode(Node):
         if payload.get("command") != "begin":
             return
         
-        # 只记录已经收到run_start，暂时不开始MAP
+        # 记录已经收到run_start
         self.run_start_received = True
 
         self.get_logger().info(
-            "Run start received; waiting for course config"
+            "Run start received"
         )
 
-    # 收到OCS赛场配置后，原样转发给UAV
+        # 检查是否同时已经收到course_config
+        self.try_start_map()
+
     def _on_course_config(self, msg: String) -> None:
+        # 记录已经收到course_config
+        self.course_config_received = True
+
         # 把赛场配置信息转发给UAV
         forwarded_msg = String()
         forwarded_msg.data = msg.data
@@ -250,20 +261,11 @@ class MissionPlannerNode(Node):
         )
 
         self.get_logger().info(
-            "Course configuration forwarded to UAV"
+            "Course configuration received and forwarded to UAV"
         )
 
-        # 必须先收到run_start
-        if not self.run_start_received:
-            return
-
-        # 防止重复启动
-        if self.state != "WAIT_FOR_BEGIN":
-            return
-
-        # 开始MAP任务
-        self.set_main_state("MAP_EXECUTE")
-        self.publish_map_start()
+        # 检查是否同时已经收到run_start
+        self.try_start_map()
 
     # 收到USV任务结果后，原样转发给OCS
     def _on_usv_result(self, msg: String) -> None:
@@ -410,6 +412,27 @@ class MissionPlannerNode(Node):
 
         #更新完之后，同时也需要publish combined progress
         self.publish_combined_progress()
+
+    # 同时收到run_start和course_config后开始MAP
+    def try_start_map(self) -> None:
+        # 只能从WAIT_FOR_BEGIN开始
+        if self.state != "WAIT_FOR_BEGIN":
+            return
+
+        # 必须收到run_start
+        if not self.run_start_received:
+            return
+
+        # 必须收到course_config
+        if not self.course_config_received:
+            return
+
+        self.get_logger().info(
+            "Run start and course configuration received; starting MAP"
+        )
+
+        self.set_main_state("MAP_EXECUTE")
+        self.publish_map_start()
 
     # 当接收到task begin的信息时候，其回调函数_on_run_start会调用这个函数，用于给uav和usv，比赛开始的信息
     def publish_map_start(self) -> None:
